@@ -119,6 +119,11 @@ button:disabled{opacity:.35;cursor:not-allowed}
 .net-sep{text-align:center;color:#758078;font-size:11px;text-transform:uppercase;letter-spacing:.12em;margin:14px 0 0}
 .net-badge{background:#15352f;border:1px solid #2f7669;color:#9cebdc;padding:6px 9px;border-radius:999px;font-weight:900}
 @media(max-width:520px){.online-row{grid-template-columns:1fr}.online-row button{width:100%}}
+
+.reveal-notice{margin-top:8px;padding:10px;border:1px solid #c8a95d;border-radius:10px;background:#282315;color:#f3e5b8;display:grid;gap:7px}
+.reveal-notice b{font-size:12px;letter-spacing:.08em}
+.reveal-notice span{font-size:11px;line-height:1.35;color:#ddd2b5}
+.reveal-notice button{width:100%}
 </style>
 <script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
 </head>
@@ -312,6 +317,10 @@ function performNetAction(action,i){
   else if(action==="reveal")local_revealTrait(i);
   else if(action==="sign")local_signCard(i);
   else if(action==="discard")local_discardCard(i);
+  else if(action==="continueSign"){
+    const ps=G.pendingSigning;
+    if(ps && ps.playerIndex===G.current) finalizeSigning(ps.marketIndex,ps.playerIndex,ps.preRevealCount,ps.autoCount);
+  }
   else if(action==="end")local_endTurn();
   syncOnline();
 }
@@ -422,35 +431,88 @@ function local_discardCard(i){
   G.market[i]=null;refillSlot(i);render();
 }
 function local_signCard(i){
-  if(current().bot||G.over||!canZeroAction())return;
+  if(current().bot||G.over||!canZeroAction()||G.pendingSigning)return;
   const c=G.market[i]; if(!c||c.scoutOwner===null)return;
-  const result=scoreSigning(c,current());
-  current().score+=result.total;
-  consumeRequests(result.fulfilled,current());
-  log(current().name+" подписал "+c.name+": "+signedBreakdown(result));
-  if(current().score>=G.target && !G.finalRound){G.finalRound=true;log("⚑ Достигнуты "+G.target+" очков. Доигрываем текущий круг.")}
+
+  // Если есть скрытые характеристики — сначала только довскрываем их.
+  if(c.revealed.length<c.potential){
+    const preRevealCount=c.revealed.length;
+    const auto=[];
+    while(c.revealed.length<c.potential){
+      const ch=drawChar(); if(!ch)break;
+      auto.push(ch);
+      c.revealed.push({...ch,scouted:false});
+    }
+    G.pendingSigning={
+      marketIndex:i,
+      playerIndex:G.current,
+      preRevealCount,
+      autoCount:auto.length
+    };
+    log("🔎 Довскрытие "+c.name+": открыты оставшиеся характеристики. Нажмите «Продолжить».");
+    render();
+    return;
+  }
+
+  finalizeSigning(i,G.current,c.revealed.length,0);
+}
+
+function finalizeSigning(i,playerIndex,preRevealCount,autoCount){
+  const c=G.market[i]; if(!c)return;
+  const p=G.players[playerIndex];
+  const result=scoreSigning(c,p,{preRevealCount,autoCount});
+  p.score+=result.total;
+  consumeRequests(result.fulfilled,p);
+  log(p.name+" подписал "+c.name+": "+signedBreakdown(result));
+  if(p.score>=G.target && !G.finalRound){G.finalRound=true;log("⚑ Достигнуты "+G.target+" очков. Доигрываем текущий круг.")}
   for(const ch of c.revealed)G.charDiscard.push(ch);
   recycleFootballer(c);
-  G.market[i]=null;refillSlot(i);render();
+  G.market[i]=null;
+  G.pendingSigning=null;
+  refillSlot(i);
+  render();
 }
-function scoreSigning(c,p){
+
+function continueSigning(){
+  if(!G||!G.pendingSigning)return;
+  const ps=G.pendingSigning;
+  if(NET.online){
+    if(NET.isHost){
+      if(G.current!==NET.localIndex)return;
+      finalizeSigning(ps.marketIndex,ps.playerIndex,ps.preRevealCount,ps.autoCount);
+      syncOnline();
+    }else if(NET.hostConn?.open){
+      NET.hostConn.send({type:"action",action:"continueSign",i:ps.marketIndex});
+    }
+    return;
+  }
+  if(G.current!==ps.playerIndex)return;
+  finalizeSigning(ps.marketIndex,ps.playerIndex,ps.preRevealCount,ps.autoCount);
+}
+
+function scoreSigning(c,p,opts={}){
+  const preRevealCount = opts.preRevealCount ?? c.revealed.length;
+  const autoCount = opts.autoCount ?? 0;
   let base=c.startVal;
   let traitTotals={[c.startTrait]:c.startVal};
   let negSeen=new Set();
-  let fully=c.revealed.length>=c.potential;
-  let allPositive=c.revealed.every(x=>x.val>0);
-  // revealed before signing score normally
-  for(const ch of c.revealed){base+=ch.val;traitTotals[ch.trait]=(traitTotals[ch.trait]||0)+ch.val;if(ch.val<0)negSeen.add(ch.trait)}
-  // auto reveal hidden after signing
-  let auto=[];
-  while(c.revealed.length+auto.length<c.potential){const ch=drawChar(); if(!ch)break; auto.push(ch)}
-  for(const ch of auto){
-    if(ch.val<0){base+=ch.val*G.hiddenNegPenalty;negSeen.add(ch.trait)}
-    // hidden positives = 0
-    c.revealed.push({...ch,scouted:false});
-  }
-  let fullScout=fully&&allPositive;
+
+  // Карты, раскрытые скаутом до подписания, считаются обычно.
+  c.revealed.forEach((ch,idx)=>{
+    const wasAuto = idx>=preRevealCount && idx<preRevealCount+autoCount;
+    if(wasAuto){
+      if(ch.val<0){base+=ch.val*G.hiddenNegPenalty;negSeen.add(ch.trait)}
+      // положительная карта из довскрытия даёт 0 очков
+    }else{
+      base+=ch.val;
+      traitTotals[ch.trait]=(traitTotals[ch.trait]||0)+ch.val;
+      if(ch.val<0)negSeen.add(ch.trait);
+    }
+  });
+
+  const fullScout = autoCount===0 && c.revealed.length>=c.potential && c.revealed.every(x=>x.val>0);
   if(fullScout)base*=2;
+
   let bonus=0, fulfilled=[];
   for(let idx=0;idx<p.requests.length;idx++){
     const r=p.requests[idx];
@@ -460,7 +522,7 @@ function scoreSigning(c,p){
     }else if(r.type==="lang" && c.language && c.language.name===r.value){bonus+=4;fulfilled.push(idx)}
     else if(r.type==="absence" && !negSeen.has(r.value) && c.revealed.length===c.potential){bonus+=4;fulfilled.push(idx)}
   }
-  return {base,bonus,total:base+bonus,fullScout,auto,fulfilled};
+  return {base,bonus,total:base+bonus,fullScout,auto:c.revealed.slice(preRevealCount,preRevealCount+autoCount),fulfilled};
 }
 function consumeRequests(indexes,p){
   indexes=[...new Set(indexes)].sort((a,b)=>b-a);
@@ -515,7 +577,10 @@ function botTurn(){
 }
 function estimateVisible(c){return c.startVal+c.revealed.reduce((s,x)=>s+x.val,0)}
 function botSign(i){
-  const c=G.market[i];const r=scoreSigning(c,current());current().score+=r.total;consumeRequests(r.fulfilled,current());
+  const c=G.market[i];
+  const pre=c.revealed.length;
+  while(c.revealed.length<c.potential){const ch=drawChar();if(!ch)break;c.revealed.push({...ch,scouted:false})}
+  const r=scoreSigning(c,current(),{preRevealCount:pre,autoCount:c.revealed.length-pre});current().score+=r.total;consumeRequests(r.fulfilled,current());
   log(current().name+" подписал "+c.name+": "+signedBreakdown(r));
   if(current().score>=G.target&&!G.finalRound){G.finalRound=true;log("⚑ Достигнуты "+G.target+" очков. Доигрываем текущий круг.")}
   for(const ch of c.revealed)G.charDiscard.push(ch);recycleFootballer(c);G.market[i]=null;refillSlot(i);
@@ -534,7 +599,7 @@ function render(){
   document.getElementById("apPill").textContent="ОД: "+G.ap+"/4";
   document.getElementById("scorePill").textContent="Очки: "+localPlayer().score;
   document.getElementById("targetPill").textContent="Цель: "+G.target;
-  document.getElementById("endTurnBtn").disabled=G.over||current().bot||(NET.online&&G.current!==NET.localIndex);
+  document.getElementById("endTurnBtn").disabled=G.over||current().bot||!!G.pendingSigning||(NET.online&&G.current!==NET.localIndex);
   renderMarket();renderSide();
 }
 function renderMarket(){
@@ -554,17 +619,25 @@ function renderMarket(){
     const lang=c.language?`<div class="lang-card">${c.language.name.toUpperCase()}<span class="flag">${c.language.flag}</span></div>`:"";
     const owner=c.scoutOwner===null?"":`<div class="scout-badge">${G.players[c.scoutOwner].name}</div>`;
     const myIndex=NET.online?NET.localIndex:G.current;
-    const human=!current().bot&&!G.over&&(!NET.online||G.current===myIndex);
+    const human=!current().bot&&!G.over&&!G.pendingSigning&&(!NET.online||G.current===myIndex);
     const canStart=human&&c.scoutOwner===null&&G.ap>=2;
     const canReveal=human&&c.scoutOwner===G.current&&G.ap>=1&&c.revealed.length<c.potential;
     const canSign=human&&c.scoutOwner!==null&&G.ap>=1;
     const canDiscard=human&&c.scoutOwner===G.current&&G.ap>=1;
     const fullReport=c.revealed.length===c.potential&&c.revealed.every(ch=>ch.val>0);
     const fullReportBadge=fullReport?`<div class="full-report-badge">⭐ ПОЛНЫЙ ОТЧЁТ ×2</div>`:"";
+    const pendingHere=G.pendingSigning&&G.pendingSigning.marketIndex===i;
+    const canContinue=pendingHere&&G.pendingSigning.playerIndex===G.current&&(!NET.online||G.current===myIndex);
+    const revealNotice=pendingHere?`<div class="reveal-notice">
+      <b>🔎 ДОВСКРЫТИЕ</b>
+      <span>Оставшиеся характеристики открыты. Посмотрите результат перед подсчётом очков.</span>
+      <button class="primary" ${canContinue?"":"disabled"} onclick="continueSigning()">Продолжить</button>
+    </div>`:"";
     div.innerHTML=`<div class="stack" style="--reveals:${c.revealed.length}">
       ${under}${lang}<div class="player-card" onclick="inspect(${i})"><img src="${c.art}">${owner}</div></div>
       <div class="card-meta"><span>Потенциал ${c.potential}</span><span>${c.revealed.length}/${c.potential}</span></div>
       ${fullReportBadge}
+      ${revealNotice}
       <div class="actions">
         <button ${canStart?"":"disabled"} onclick="startScout(${i})">Начать скаутинг · 2 ОД</button>
         <button ${canReveal?"":"disabled"} onclick="revealTrait(${i})">Раскрыть · 1 ОД</button>
@@ -618,7 +691,8 @@ function showRules(){
 
     <h3>2. Что находится на рынке</h3>
     <p>
-      На столе всегда лежат <b>5 футболистов</b>. На каждой карте уже есть одно врождённое положительное качество
+      На рынке лежит <b>на одного футболиста больше, чем игроков в партии</b>: вдвоём — 3 футболиста,
+      втроём — 4, вчетвером — 5 и так далее. На каждой карте уже есть одно врождённое положительное качество
       и число <b>Потенциал</b> — сколько дополнительных характеристик этого футболиста можно раскрыть.
     </p>
     <p>
@@ -658,7 +732,7 @@ function showRules(){
       Плюсы увеличивают ценность, минусы уменьшают её.
     </p>
     <p>
-      После этого к результату могут добавиться бонусы за выполненные запросы клуба и Полный скаутинг.
+      После этого к результату могут добавиться бонусы за выполненные запросы клуба и Полный отчёт.
     </p>
 
     <h3>6. Можно подписать раньше — но это риск</h3>
@@ -666,7 +740,14 @@ function showRules(){
       Вам не обязательно раскрывать весь Потенциал. Вы можете отправить отчёт и подписать футболиста раньше —
       например, если боитесь, что соперник его заберёт.
     </p>
-    <p>После подписания все нераскрытые характеристики автоматически открываются:</p>
+    <p>
+      Если вы подписываете футболиста раньше полного раскрытия, сначала начинается <b>довскрытие</b>:
+      все оставшиеся характеристики открываются и появляются под карточкой футболиста. Игра останавливается,
+      чтобы вы могли спокойно посмотреть результат.
+    </p>
+    <p>
+      Только после нажатия кнопки <b>«Продолжить»</b> футболист окончательно подписывается и начисляются очки:
+    </p>
     <ul>
       <li>скрытая <b>положительная</b> характеристика приносит <b>0 очков</b> — вы её не нашли;</li>
       <li>скрытая <b>отрицательная</b> характеристика получает усиленный штраф: в этой партии её значение умножается на <b>×${penalty}</b>.</li>
@@ -675,17 +756,17 @@ function showRules(){
       Поэтому раннее подписание — это настоящий риск: вы защищаете игрока от конкурентов, но можете купить кота в мешке.
     </p>
 
-    <h3>7. Полный скаутинг ⭐</h3>
+    <h3>7. Полный отчёт ⭐</h3>
     <p>
       Если <b>до подписания</b> вы раскрыли весь Потенциал футболиста и <b>каждая</b> дополнительная характеристика оказалась положительной,
-      вы получаете <b>Полный скаутинг</b>.
+      вы получаете <b>Полный отчёт</b>.
     </p>
     <p>
       В этом случае базовая ценность футболиста <b>удваивается</b>. Если среди дополнительных характеристик есть хотя бы один минус,
-      Полный скаутинг невозможен.
+      Полный отчёт невозможен.
     </p>
     <p>
-      Если последняя положительная характеристика открылась уже автоматически после раннего подписания — это тоже не Полный скаутинг:
+      Если последняя положительная характеристика открылась уже автоматически после раннего подписания — это тоже не Полный отчёт:
       вы должны были найти всё самостоятельно.
     </p>
 
