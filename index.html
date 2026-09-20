@@ -291,6 +291,12 @@ function startOnlineGame(){
     while(G.players.length>NET.names.length)G.players.pop();
   }
   G.players.forEach((p,i)=>{p.name=NET.names[i];p.bot=false});
+  const wantedMarketSize=G.players.length+1;
+  while(G.market.length<wantedMarketSize) refillSlot(G.market.length);
+  while(G.market.length>wantedMarketSize){
+    const c=G.market.pop();
+    if(c) recycleFootballer(c);
+  }
   G.target=target;G.hiddenNegPenalty=penalty;G.current=0;G.roundStart=0;
   NET.started=true;NET.localIndex=0;showNetBadge();render();syncOnline();
 }
@@ -357,7 +363,7 @@ function startGame(){
      footballDeck:shuffle(FOOTBALLERS.map(x=>({...x}))),footballDiscard:[],market:[],charDeck:makeCharDeck(),charDiscard:[],
      reqDeck:makeRequestDeck(),reqDiscard:[],log:[]};
   for(const p of ps) for(let i=0;i<3;i++) p.requests.push(drawReq());
-  for(let i=0;i<5;i++) refillSlot(i);
+  for(let i=0;i<G.players.length+1;i++) refillSlot(i);
   document.getElementById("setup").style.display="none";document.getElementById("game").style.display="";
   log("Стартовый игрок: "+G.players[G.current].name);
   render();
