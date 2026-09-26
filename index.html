@@ -124,8 +124,18 @@ button:disabled{opacity:.35;cursor:not-allowed}
 .reveal-notice b{font-size:12px;letter-spacing:.08em}
 .reveal-notice span{font-size:11px;line-height:1.35;color:#ddd2b5}
 .reveal-notice button{width:100%}
+
+.kick-btn,.kick-mini{border:1px solid #783c3c;background:#3b1d1d;color:#ffd1d1;border-radius:7px;padding:3px 7px;font-size:10px;font-weight:900;cursor:pointer}
+.kick-mini{padding:0 5px;margin-left:3px}
+.score-admin{display:flex;align-items:center;gap:7px}
+.offline{color:#d39a76;font-size:9px;font-weight:800;margin-left:5px}
 </style>
-<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js">window.addEventListener("DOMContentLoaded",()=>{
+  const r=localStorage.getItem("scouts-last-room"), n=localStorage.getItem("scouts-last-name");
+  if(r&&document.getElementById("roomCode"))document.getElementById("roomCode").value=r;
+  if(n&&document.getElementById("netName"))document.getElementById("netName").value=n;
+});
+</script>
 </head>
 <body>
 <div class="app">
@@ -206,23 +216,41 @@ button:disabled{opacity:.35;cursor:not-allowed}
 <script>
 
 // ===== СЕТЕВАЯ ИГРА: PeerJS, хост хранит истинное состояние партии =====
-const NET={peer:null,isHost:false,hostConn:null,clients:[],localIndex:0,room:"",names:[],online:false,started:false};
+const NET={peer:null,isHost:false,hostConn:null,clients:[],localIndex:0,room:"",names:[],online:false,started:false,playerTokens:[]};
 function netSetStatus(t){const e=document.getElementById("netStatus");if(e)e.textContent=t}
 function cleanName(){return (document.getElementById("netName")?.value||"").trim()||"Скаут"}
 function makeCode(){const a="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";let r="";for(let i=0;i<5;i++)r+=a[Math.floor(Math.random()*a.length)];return r}
 function updateLobby(){
-  const e=document.getElementById("netPlayers");if(e)e.innerHTML=NET.names.map((n,i)=>`<span class="net-chip">${i+1}. ${n}${i===0?" 👑":""}</span>`).join("");
+  const e=document.getElementById("netPlayers");
+  if(e)e.innerHTML=NET.names.map((n,i)=>`<span class="net-chip">${i+1}. ${n}${i===0?" 👑":""}${NET.isHost&&i>0&&!NET.started?` <button class="kick-mini" onclick="kickLobbyPlayer(${i})">×</button>`:""}</span>`).join("");
   const b=document.getElementById("netStartBtn");if(b)b.style.display=NET.isHost&&NET.online?"block":"none";
 }
 function hostRoom(){
   if(NET.peer){netSetStatus("Сетевая сессия уже создана.");return}
   NET.isHost=true;NET.online=true;NET.names=[cleanName()];NET.localIndex=0;NET.room=makeCode();
+  NET.playerTokens=["HOST-"+crypto.randomUUID()];
+  localStorage.setItem("scouts-last-room",NET.room);
+  localStorage.setItem("scouts-last-name",NET.names[0]);
   netSetStatus("Создаём комнату…");
   NET.peer=new Peer("scouts-"+NET.room);
   NET.peer.on("open",()=>{netSetStatus("Код комнаты: "+NET.room+" — отправьте его друзьям.");updateLobby()});
   NET.peer.on("connection",conn=>{
     conn.on("data",msg=>hostReceive(conn,msg));
-    conn.on("close",()=>{NET.clients=NET.clients.filter(x=>x.conn!==conn);if(!NET.started){NET.names=[NET.names[0],...NET.clients.map(x=>x.name)];broadcastLobby();}});
+    conn.on("close",()=>{
+      const rec=NET.clients.find(x=>x.conn===conn);
+      if(!rec)return;
+      if(NET.started){
+        rec.connected=false;
+        if(G?.players?.[rec.index])G.players[rec.index].connected=false;
+        log("⚠ "+rec.name+" отключился. Место сохранено для переподключения.");
+        syncOnline();render();
+      }else{
+        NET.clients=NET.clients.filter(x=>x!==rec);
+        NET.names=[NET.names[0],...NET.clients.map(x=>x.name)];
+        NET.playerTokens=[NET.playerTokens[0],...NET.clients.map(x=>x.token)];
+        broadcastLobby();
+      }
+    });
   });
   NET.peer.on("error",e=>{netSetStatus("Ошибка сети: "+e.type+". Попробуйте создать комнату ещё раз.");NET.peer=null});
 }
@@ -230,11 +258,17 @@ function joinRoom(){
   if(NET.peer){netSetStatus("Сетевая сессия уже запущена.");return}
   const code=(document.getElementById("roomCode")?.value||"").trim().toUpperCase();
   if(!code){netSetStatus("Введите код комнаты.");return}
-  NET.isHost=false;NET.online=true;NET.room=code;NET.names=[cleanName()];netSetStatus("Подключаемся…");
+  NET.isHost=false;NET.online=true;NET.room=code;NET.names=[cleanName()];
+  localStorage.setItem("scouts-last-room",code);
+  localStorage.setItem("scouts-last-name",cleanName());
+  netSetStatus("Подключаемся…");
   NET.peer=new Peer();
   NET.peer.on("open",()=>{
     const c=NET.peer.connect("scouts-"+code,{reliable:true});NET.hostConn=c;
-    c.on("open",()=>c.send({type:"join",name:cleanName()}));
+    c.on("open",()=>{
+      const token=localStorage.getItem("scouts-token-"+code)||"";
+      c.send({type:"join",name:cleanName(),token});
+    });
     c.on("data",clientReceive);
     c.on("close",()=>netSetStatus("Связь с ведущим потеряна."));
   });
@@ -242,29 +276,82 @@ function joinRoom(){
 }
 function hostReceive(conn,msg){
   if(!msg||!msg.type)return;
-  if(msg.type==="join"&&!NET.started){
-    if(NET.clients.length>=7){conn.send({type:"error",text:"Комната заполнена."});return}
-    const rec={conn,name:(msg.name||"Скаут").slice(0,20),index:NET.clients.length+1};
-    NET.clients.push(rec);NET.names=[NET.names[0],...NET.clients.map(x=>x.name)];
-    broadcastLobby();return;
+
+  if(msg.type==="join"){
+    // Переподключение к уже идущей партии по сохранённому токену.
+    if(NET.started){
+      const idx=msg.token?NET.playerTokens.indexOf(msg.token):-1;
+      if(idx<=0 || !G?.players?.[idx]){
+        conn.send({type:"error",text:"Партия уже началась. Для возврата откройте игру на том же устройстве/браузере, с которого вы входили в комнату."});
+        setTimeout(()=>conn.close(),200);
+        return;
+      }
+      let rec=NET.clients.find(x=>x.index===idx);
+      if(rec?.conn?.open && rec.connected){
+        conn.send({type:"error",text:"Этот игрок уже подключён к партии."});
+        setTimeout(()=>conn.close(),200);
+        return;
+      }
+      if(!rec){
+        rec={conn,name:G.players[idx].name,index:idx,token:msg.token,connected:true};
+        NET.clients.push(rec);
+      }else{
+        rec.conn=conn;rec.connected=true;rec.name=G.players[idx].name;
+      }
+      G.players[idx].connected=true;
+      conn.send({type:"welcomeBack",token:msg.token,index:idx,name:G.players[idx].name,room:NET.room});
+      conn.send({type:"state",state:publicStateFor(idx),index:idx});
+      log("↩ "+G.players[idx].name+" вернулся в игру.");
+      syncOnline();render();
+      return;
+    }
+
+    // Новый игрок до старта.
+    if(NET.clients.length>=17){conn.send({type:"error",text:"Комната заполнена."});return}
+    const token=(crypto.randomUUID?crypto.randomUUID():String(Date.now())+"-"+Math.random());
+    const rec={conn,name:(msg.name||"Скаут").slice(0,20),index:NET.clients.length+1,token,connected:true};
+    NET.clients.push(rec);
+    NET.names=[NET.names[0],...NET.clients.map(x=>x.name)];
+    NET.playerTokens=[NET.playerTokens[0],...NET.clients.map(x=>x.token)];
+    conn.send({type:"identity",token,index:rec.index,room:NET.room,name:rec.name});
+    broadcastLobby();
+    return;
   }
+
   if(msg.type==="action"&&NET.started){
-    const rec=NET.clients.find(x=>x.conn===conn);if(!rec||!G||G.over)return;
+    const rec=NET.clients.find(x=>x.conn===conn);if(!rec||!rec.connected||!G||G.over)return;
     if(G.current!==rec.index)return;
     performNetAction(msg.action,msg.i);
   }
 }
 function broadcastLobby(){
   updateLobby();
-  NET.clients.forEach((x,i)=>{x.index=i+1;x.conn.send({type:"lobby",names:NET.names,index:x.index,room:NET.room})});
+  NET.clients.forEach((x,i)=>{
+    x.index=i+1;
+    if(x.conn?.open)x.conn.send({type:"lobby",names:NET.names,index:x.index,room:NET.room,token:x.token});
+  });
 }
 function clientReceive(msg){
   if(!msg)return;
-  if(msg.type==="lobby"){NET.names=msg.names;NET.localIndex=msg.index;netSetStatus("Комната "+msg.room+". Ждём, когда ведущий начнёт игру.");updateLobby()}
+  if(msg.type==="identity"||msg.type==="welcomeBack"){
+    if(msg.token)localStorage.setItem("scouts-token-"+msg.room,msg.token);
+    if(msg.name)localStorage.setItem("scouts-last-name",msg.name);
+    NET.localIndex=msg.index;
+  }
+  if(msg.type==="lobby"){
+    NET.names=msg.names;NET.localIndex=msg.index;
+    if(msg.token)localStorage.setItem("scouts-token-"+msg.room,msg.token);
+    netSetStatus("Комната "+msg.room+". Ждём, когда ведущий начнёт игру.");updateLobby();
+  }
   if(msg.type==="state"){
     NET.started=true;NET.localIndex=msg.index;G=msg.state;
     document.getElementById("setup").style.display="none";document.getElementById("game").style.display="block";
     showNetBadge();render();
+  }
+  if(msg.type==="kicked"){
+    alert("Ведущий удалил вас из партии.");
+    localStorage.removeItem("scouts-token-"+NET.room);
+    location.reload();
   }
   if(msg.type==="error")netSetStatus(msg.text||"Ошибка.");
 }
@@ -275,11 +362,87 @@ function publicStateFor(index){
 }
 function syncOnline(){
   if(!NET.online||!NET.isHost||!G)return;
-  NET.clients.forEach(x=>x.conn.open&&x.conn.send({type:"state",state:publicStateFor(x.index),index:x.index}));
+  NET.clients.forEach(x=>x.connected&&x.conn?.open&&x.conn.send({type:"state",state:publicStateFor(x.index),index:x.index}));
 }
 function showNetBadge(){
   const b=document.getElementById("netBadge");if(b){b.style.display="block";b.textContent="🌐 "+NET.room}
 }
+
+function kickLobbyPlayer(index){
+  if(!NET.isHost||NET.started||index<=0)return;
+  const rec=NET.clients.find(x=>x.index===index);
+  if(rec?.conn?.open)rec.conn.send({type:"kicked"});
+  if(rec?.conn)rec.conn.close();
+  NET.clients=NET.clients.filter(x=>x!==rec);
+  NET.names=[NET.names[0],...NET.clients.map(x=>x.name)];
+  NET.playerTokens=[NET.playerTokens[0],...NET.clients.map(x=>x.token)];
+  broadcastLobby();
+}
+
+function kickGamePlayer(index){
+  if(!NET.isHost||!NET.started||!G||index<=0||index>=G.players.length)return;
+  const p=G.players[index];
+  if(!confirm("Удалить игрока «"+p.name+"» из партии? Его футболисты в скаутинге будут списаны."))return;
+
+  // Если игрок был в процессе довскрытия — его футболист тоже списывается.
+  if(G.pendingSigning && G.pendingSigning.playerIndex===index){
+    const mi=G.pendingSigning.marketIndex, c=G.market[mi];
+    if(c){
+      for(const ch of c.revealed)G.charDiscard.push(ch);
+      recycleFootballer(c);G.market[mi]=null;
+    }
+    G.pendingSigning=null;
+  }
+
+  // Все футболисты, которых скаутил удаляемый игрок, списываются.
+  G.market.forEach((c,i)=>{
+    if(c&&c.scoutOwner===index){
+      for(const ch of c.revealed)G.charDiscard.push(ch);
+      recycleFootballer(c);
+      G.market[i]=null;
+    }
+  });
+
+  const rec=NET.clients.find(x=>x.index===index);
+  if(rec?.conn?.open)rec.conn.send({type:"kicked"});
+  if(rec?.conn)rec.conn.close();
+
+  // Удаляем место игрока.
+  G.players.splice(index,1);
+  NET.names.splice(index,1);
+  NET.playerTokens.splice(index,1);
+  NET.clients=NET.clients.filter(x=>x!==rec);
+
+  // Индексы владельцев скаутинга и подключений сдвигаются.
+  G.market.forEach(c=>{if(c&&c.scoutOwner>index)c.scoutOwner--});
+  NET.clients.forEach(x=>{if(x.index>index)x.index--});
+
+  // Корректируем текущий ход.
+  if(G.current>index)G.current--;
+  else if(G.current===index){
+    if(G.current>=G.players.length)G.current=0;
+    G.ap=4;
+  }
+  if(G.roundStart>index)G.roundStart--;
+  else if(G.roundStart>=G.players.length)G.roundStart=0;
+
+  // Новый размер рынка = игроков + 1. Сначала убираем лишние пустые слоты/карты с конца,
+  // затем заполняем нужное количество.
+  const wanted=G.players.length+1;
+  while(G.market.length>wanted){
+    const c=G.market.pop();
+    if(c){
+      for(const ch of c.revealed)G.charDiscard.push(ch);
+      recycleFootballer(c);
+    }
+  }
+  while(G.market.length<wanted)G.market.push(null);
+  for(let i=0;i<G.market.length;i++)if(!G.market[i])refillSlot(i);
+
+  log("🚫 Ведущий удалил "+p.name+" из партии.");
+  syncOnline();render();
+}
+
 function startOnlineGame(){
   if(!NET.isHost||NET.started)return;
   if(NET.names.length<2){netSetStatus("Нужен хотя бы ещё один игрок.");return}
@@ -295,7 +458,7 @@ function startOnlineGame(){
     while(G.players.length<NET.names.length)G.players.push({name:"Игрок "+(G.players.length+1),bot:false,score:0,requests:[drawReq(),drawReq(),drawReq()],turns:0});
     while(G.players.length>NET.names.length)G.players.pop();
   }
-  G.players.forEach((p,i)=>{p.name=NET.names[i];p.bot=false});
+  G.players.forEach((p,i)=>{p.name=NET.names[i];p.bot=false;p.connected=(i===0)||!!NET.clients.find(x=>x.index===i&&x.connected)});
   const wantedMarketSize=G.players.length+1;
   while(G.market.length<wantedMarketSize) refillSlot(G.market.length);
   while(G.market.length>wantedMarketSize){
@@ -648,7 +811,11 @@ function renderMarket(){
   })
 }
 function renderSide(){
-  document.getElementById("scoreboard").innerHTML=G.players.map((p,i)=>`<div class="score-row ${i===G.current?"active":""}"><span>${p.name}${p.bot?" 🤖":""}</span><b>${p.score}</b></div>`).join("");
+  document.getElementById("scoreboard").innerHTML=G.players.map((p,i)=>{
+    const offline=NET.online&&!p.bot&&p.connected===false;
+    const kick=NET.online&&NET.isHost&&i>0?`<button class="kick-btn" onclick="kickGamePlayer(${i})">Кик</button>`:"";
+    return `<div class="score-row ${i===G.current?"active":""}"><span>${p.name}${p.bot?" 🤖":""}${offline?' <small class="offline">● не в сети</small>':""}</span><span class="score-admin"><b>${p.score}</b>${kick}</span></div>`;
+  }).join("");
   document.getElementById("gameSettings").innerHTML=`
     <div class="request"><b>Цель: ${G.target} очков</b><span>Скрытый негатив: ×${G.hiddenNegPenalty}</span></div>
     <div class="request"><b>Колода характеристик: 69 карт</b><span>54 плюса / 15 минусов · 78,26% положительных</span></div>`;
